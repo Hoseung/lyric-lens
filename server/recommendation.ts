@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { storage } from "./storage";
 import { searchBraveLyrics, searchBraveYoutube } from "./brave-search";
-import type { Song } from "@shared/schema";
+import type { Song, SeedSong } from "@shared/schema";
 
 const openai = new OpenAI({
   apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
@@ -16,34 +16,62 @@ interface LLMRecommendation {
   lyric_excerpt: string;
 }
 
-export async function generateRecommendations(roundId: number): Promise<void> {
-  try {
-    const playlistItems = await storage.getPlaylist();
-    const likedSongs = playlistItems.map(p => `${p.song.artist} - ${p.song.title}`);
-    const alreadyRecommended = await storage.getAllRecommendedSongKeys();
+interface PlaylistContext {
+  song: Song;
+  likeReason: string | null;
+}
 
-    const systemPrompt = `You are a Korean music curator specializing in songs with exceptional lyrics.
-Your expertise is in finding songs where the lyrics have literary quality, emotional depth, and distinctive texture.
+function buildUserPrompt(context: {
+  preferences?: string | null;
+  seedSongs: SeedSong[];
+  playlistContext: PlaylistContext[];
+  alreadyRecommended: string[];
+}): string {
+  let prompt = `Generate exactly 5 song recommendations based on the user's taste.\n\n`;
 
-You focus on these lyric qualities:
-- Living language (everyday words used poetically)
-- Interpretive space (lyrics that invite personal meaning)
-- Emotional temperature (warmth, coolness, intimacy)
-- Contemplative depth (philosophical or introspective quality)
-- Imagery (vivid, sensory descriptions)
+  // Add user preferences if provided
+  if (context.preferences) {
+    prompt += `USER'S LYRICAL PREFERENCES:\n${context.preferences}\n\n`;
+  }
 
-You recommend songs primarily in Korean, but can include other languages if the lyrics are outstanding.
-Always recommend REAL songs by REAL artists. Never invent fictional songs.`;
+  // Add seed songs if provided (for initial guidance)
+  if (context.seedSongs.length > 0) {
+    prompt += `SEED SONGS (user-provided starting points - use these to understand their taste):\n`;
+    prompt += context.seedSongs.map(s => `- ${s.artist} - ${s.title}`).join('\n');
+    prompt += `\n\n`;
+  }
 
-    const userPrompt = `Generate exactly 5 song recommendations based on the user's taste.
+  // Add playlist with reasons (most recent 30 songs)
+  if (context.playlistContext.length > 0) {
+    prompt += `SONGS THE USER HAS LIKED:\n`;
+    const recentSongs = context.playlistContext.slice(0, 30);
+    prompt += recentSongs.map(item => {
+      let entry = `- ${item.song.artist} - ${item.song.title}`;
+      if (item.likeReason) {
+        entry += `\n  Why they liked it: ${item.likeReason}`;
+      }
+      if (item.song.lyricSummary) {
+        entry += `\n  Lyric style: ${item.song.lyricSummary}`;
+      }
+      return entry;
+    }).join('\n');
+    prompt += `\n\n`;
+  } else if (context.seedSongs.length === 0 && !context.preferences) {
+    prompt += `This is the first recommendation. Start with a diverse selection of Korean songs known for exceptional lyrics.\n\n`;
+  }
 
-${likedSongs.length > 0 ? `Songs the user has liked:\n${likedSongs.slice(-20).map(s => `- ${s}`).join('\n')}` : 'This is the first recommendation. Start with a diverse selection of Korean songs known for exceptional lyrics.'}
+  // Add exclusion list
+  if (context.alreadyRecommended.length > 0) {
+    prompt += `Songs already recommended (DO NOT recommend these again):\n`;
+    prompt += context.alreadyRecommended.slice(-50).map(k => `- ${k}`).join('\n');
+    prompt += `\n\n`;
+  }
 
-${alreadyRecommended.length > 0 ? `\nSongs already recommended (DO NOT recommend these again):\n${alreadyRecommended.slice(-50).map(k => `- ${k}`).join('\n')}` : ''}
-
-Rules:
+  prompt += `Rules:
 - Recommend exactly 5 songs
 - Each must be a REAL song by a REAL artist
+- Consider the user's stated preferences when making recommendations
+- Pay close attention to why the user liked previous songs - find songs with similar lyrical qualities
 - Prioritize Korean songs with beautiful lyrics
 - Mix well-known and lesser-known artists
 - Avoid repeating any previously recommended songs
@@ -62,6 +90,54 @@ Respond in this exact JSON format:
     }
   ]
 }`;
+
+  return prompt;
+}
+
+export async function generateRecommendations(roundId: number, sessionId?: string): Promise<void> {
+  try {
+    // Get session data if sessionId provided
+    let preferences: string | null = null;
+    let seedSongs: SeedSong[] = [];
+    let playlistContext: PlaylistContext[] = [];
+
+    if (sessionId) {
+      const session = await storage.getSession(sessionId);
+      if (session) {
+        preferences = session.preferences;
+      }
+      seedSongs = await storage.getSeedSongs(sessionId);
+      playlistContext = await storage.getPlaylistWithReasons(sessionId);
+    } else {
+      // Fallback for legacy behavior (no session)
+      const playlistItems = await storage.getPlaylist();
+      playlistContext = playlistItems.map(p => ({
+        song: p.song,
+        likeReason: p.likeReason ?? null,
+      }));
+    }
+
+    const alreadyRecommended = await storage.getAllRecommendedSongKeys(sessionId);
+
+    const systemPrompt = `You are a Korean music curator specializing in songs with exceptional lyrics.
+Your expertise is in finding songs where the lyrics have literary quality, emotional depth, and distinctive texture.
+
+You focus on these lyric qualities:
+- Living language (everyday words used poetically)
+- Interpretive space (lyrics that invite personal meaning)
+- Emotional temperature (warmth, coolness, intimacy)
+- Contemplative depth (philosophical or introspective quality)
+- Imagery (vivid, sensory descriptions)
+
+You recommend songs primarily in Korean, but can include other languages if the lyrics are outstanding.
+Always recommend REAL songs by REAL artists. Never invent fictional songs.`;
+
+    const userPrompt = buildUserPrompt({
+      preferences,
+      seedSongs,
+      playlistContext,
+      alreadyRecommended,
+    });
 
     const response = await openai.chat.completions.create({
       model: "gpt-5.2",

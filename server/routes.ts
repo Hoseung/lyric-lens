@@ -8,10 +8,89 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
 
-  app.post("/api/recommendations/next", async (_req, res) => {
+  // Session endpoints
+  app.post("/api/sessions", async (req, res) => {
     try {
-      const round = await storage.createRound();
-      generateRecommendations(round.id).catch(err => {
+      const { id, name, preferences, seedSongs: seedSongsInput } = req.body;
+      if (!id) {
+        return res.status(400).json({ error: "Session id is required" });
+      }
+
+      const session = await storage.createSession({ id, name, preferences });
+
+      // Add seed songs if provided
+      if (Array.isArray(seedSongsInput) && seedSongsInput.length > 0) {
+        for (const seed of seedSongsInput) {
+          if (seed.title && seed.artist) {
+            await storage.addSeedSong({
+              sessionId: session.id,
+              title: seed.title,
+              artist: seed.artist,
+            });
+          }
+        }
+      }
+
+      const seedSongs = await storage.getSeedSongs(session.id);
+      res.json({ ...session, seedSongs });
+    } catch (error) {
+      console.error("Error creating session:", error);
+      res.status(500).json({ error: "Failed to create session" });
+    }
+  });
+
+  app.get("/api/sessions", async (_req, res) => {
+    try {
+      const sessions = await storage.listSessions();
+      res.json(sessions);
+    } catch (error) {
+      console.error("Error listing sessions:", error);
+      res.status(500).json({ error: "Failed to list sessions" });
+    }
+  });
+
+  app.get("/api/sessions/:sessionId", async (req, res) => {
+    try {
+      const session = await storage.getSession(req.params.sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+      const seedSongs = await storage.getSeedSongs(session.id);
+      res.json({ ...session, seedSongs });
+    } catch (error) {
+      console.error("Error fetching session:", error);
+      res.status(500).json({ error: "Failed to fetch session" });
+    }
+  });
+
+  app.patch("/api/sessions/:sessionId", async (req, res) => {
+    try {
+      const { name, preferences } = req.body;
+      const session = await storage.updateSession(req.params.sessionId, { name, preferences });
+      const seedSongs = await storage.getSeedSongs(session.id);
+      res.json({ ...session, seedSongs });
+    } catch (error) {
+      console.error("Error updating session:", error);
+      res.status(500).json({ error: "Failed to update session" });
+    }
+  });
+
+  app.delete("/api/sessions/:sessionId", async (req, res) => {
+    try {
+      await storage.deleteSession(req.params.sessionId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting session:", error);
+      res.status(500).json({ error: "Failed to delete session" });
+    }
+  });
+
+  // Recommendation endpoints
+  app.post("/api/recommendations/next", async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      const round = await storage.createRound(sessionId);
+      generateRecommendations(round.id, sessionId).catch(err => {
         console.error("Background recommendation failed:", err);
       });
       res.json({ roundId: round.id, status: "pending" });
@@ -48,7 +127,7 @@ export async function registerRoutes(
   app.post("/api/recommendations/:roundId/select", async (req, res) => {
     try {
       const roundId = parseInt(req.params.roundId);
-      const { selectedSongIds } = req.body;
+      const { selectedSongIds, likeReasons, sessionId } = req.body;
 
       if (!Array.isArray(selectedSongIds)) {
         return res.status(400).json({ error: "selectedSongIds must be an array" });
@@ -58,7 +137,13 @@ export async function registerRoutes(
         await storage.markItemsSelected(roundId, selectedSongIds);
 
         for (const songId of selectedSongIds) {
-          await storage.addToPlaylist({ songId, roundId });
+          const likeReason = likeReasons?.[songId] || null;
+          await storage.addToPlaylist({
+            songId,
+            roundId,
+            sessionId: sessionId || null,
+            likeReason,
+          });
         }
       }
 
@@ -73,8 +158,8 @@ export async function registerRoutes(
         }
       }
 
-      const nextRound = await storage.createRound();
-      generateRecommendations(nextRound.id).catch(err => {
+      const nextRound = await storage.createRound(sessionId);
+      generateRecommendations(nextRound.id, sessionId).catch(err => {
         console.error("Background prefetch failed:", err);
       });
 
@@ -89,9 +174,11 @@ export async function registerRoutes(
     }
   });
 
-  app.get("/api/playlist", async (_req, res) => {
+  // Playlist endpoints
+  app.get("/api/playlist", async (req, res) => {
     try {
-      const playlist = await storage.getPlaylist();
+      const sessionId = req.query.sessionId as string | undefined;
+      const playlist = await storage.getPlaylist(sessionId);
       res.json(playlist);
     } catch (error) {
       console.error("Error fetching playlist:", error);

@@ -5,7 +5,10 @@ import { YouTubePlayer } from "@/components/youtube-player";
 import { RecommendationCards } from "@/components/recommendation-cards";
 import { PlaylistPanel } from "@/components/playlist-panel";
 import { WelcomeScreen } from "@/components/welcome-screen";
-import type { RecommendationItemWithSong, PlaylistItemWithSong, Song } from "@shared/schema";
+import { SessionManager } from "@/components/session-manager";
+import { LikeReasonModal } from "@/components/like-reason-modal";
+import type { SessionConfig } from "@/components/session-setup";
+import type { RecommendationItemWithSong, PlaylistItemWithSong, Song, Session } from "@shared/schema";
 import { Music2 } from "lucide-react";
 
 type RoundStatus = "idle" | "pending" | "ready" | "failed";
@@ -17,23 +20,60 @@ interface RoundData {
 }
 
 export default function Home() {
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [currentRoundId, setCurrentRoundId] = useState<number | null>(null);
   const [roundStatus, setRoundStatus] = useState<RoundStatus>("idle");
   const [recommendations, setRecommendations] = useState<RecommendationItemWithSong[]>([]);
   const [currentSong, setCurrentSong] = useState<Song | null>(null);
   const [selectedSongIds, setSelectedSongIds] = useState<Set<number>>(new Set());
   const [hasStarted, setHasStarted] = useState(false);
+  const [showLikeReasonModal, setShowLikeReasonModal] = useState(false);
+  const [pendingSelectedSongs, setPendingSelectedSongs] = useState<Song[]>([]);
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
   const pollCountRef = useRef(0);
   const MAX_POLLS = 60;
 
-  const { data: playlist = [], refetch: refetchPlaylist } = useQuery<PlaylistItemWithSong[]>({
-    queryKey: ["/api/playlist"],
+  // Fetch sessions for welcome screen
+  const { data: sessions = [] } = useQuery<Session[]>({
+    queryKey: ["/api/sessions"],
   });
 
+  // Fetch playlist scoped to current session
+  const { data: playlist = [], refetch: refetchPlaylist } = useQuery<PlaylistItemWithSong[]>({
+    queryKey: ["/api/playlist", { sessionId: currentSessionId }],
+    queryFn: async () => {
+      const url = currentSessionId
+        ? `/api/playlist?sessionId=${encodeURIComponent(currentSessionId)}`
+        : "/api/playlist";
+      const res = await fetch(url, { credentials: "include" });
+      if (!res.ok) throw new Error("Failed to fetch playlist");
+      return res.json();
+    },
+    enabled: hasStarted,
+  });
+
+  // Create session mutation
+  const createSessionMutation = useMutation({
+    mutationFn: async (config: SessionConfig) => {
+      const res = await apiRequest("POST", "/api/sessions", {
+        id: config.sessionId,
+        name: config.name,
+        preferences: config.preferences,
+        seedSongs: config.seedSongs,
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/sessions"] });
+    },
+  });
+
+  // Start round mutation
   const startRoundMutation = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/recommendations/next");
+    mutationFn: async (sessionId?: string) => {
+      const res = await apiRequest("POST", "/api/recommendations/next", {
+        sessionId: sessionId || null,
+      });
       return res.json();
     },
     onSuccess: (data: { roundId: number; status: string }) => {
@@ -45,14 +85,31 @@ export default function Home() {
     },
   });
 
+  // Select songs mutation
   const selectMutation = useMutation({
-    mutationFn: async ({ roundId, songIds }: { roundId: number; songIds: number[] }) => {
+    mutationFn: async ({
+      roundId,
+      songIds,
+      likeReasons,
+      sessionId,
+    }: {
+      roundId: number;
+      songIds: number[];
+      likeReasons?: Record<number, string>;
+      sessionId?: string | null;
+    }) => {
       const res = await apiRequest("POST", `/api/recommendations/${roundId}/select`, {
         selectedSongIds: songIds,
+        likeReasons,
+        sessionId,
       });
       return res.json();
     },
-    onSuccess: (data: { autoplaySong: Song | null; nextRound: { roundId: number; status: string }; playlistUpdated: boolean }) => {
+    onSuccess: (data: {
+      autoplaySong: Song | null;
+      nextRound: { roundId: number; status: string };
+      playlistUpdated: boolean;
+    }) => {
       if (data.autoplaySong) {
         setCurrentSong(data.autoplaySong);
       }
@@ -73,36 +130,42 @@ export default function Home() {
     pollCountRef.current = 0;
   }, []);
 
-  const pollRound = useCallback(async (roundId: number) => {
-    pollCountRef.current += 1;
-    if (pollCountRef.current > MAX_POLLS) {
-      stopPolling();
-      setRoundStatus("failed");
-      return;
-    }
-
-    try {
-      const res = await fetch(`/api/recommendations/${roundId}`);
-      if (!res.ok) return;
-      const data: RoundData = await res.json();
-
-      if (data.status === "ready") {
-        setRoundStatus("ready");
-        setRecommendations(data.items);
+  const pollRound = useCallback(
+    async (roundId: number) => {
+      pollCountRef.current += 1;
+      if (pollCountRef.current > MAX_POLLS) {
         stopPolling();
-      } else if (data.status === "failed") {
         setRoundStatus("failed");
-        stopPolling();
+        return;
       }
-    } catch (err) {
-      console.error("Polling error:", err);
-    }
-  }, [stopPolling]);
 
-  const startPolling = useCallback((roundId: number) => {
-    stopPolling();
-    pollingRef.current = setInterval(() => pollRound(roundId), 2000);
-  }, [pollRound, stopPolling]);
+      try {
+        const res = await fetch(`/api/recommendations/${roundId}`);
+        if (!res.ok) return;
+        const data: RoundData = await res.json();
+
+        if (data.status === "ready") {
+          setRoundStatus("ready");
+          setRecommendations(data.items);
+          stopPolling();
+        } else if (data.status === "failed") {
+          setRoundStatus("failed");
+          stopPolling();
+        }
+      } catch (err) {
+        console.error("Polling error:", err);
+      }
+    },
+    [stopPolling]
+  );
+
+  const startPolling = useCallback(
+    (roundId: number) => {
+      stopPolling();
+      pollingRef.current = setInterval(() => pollRound(roundId), 2000);
+    },
+    [pollRound, stopPolling]
+  );
 
   useEffect(() => {
     return () => {
@@ -110,13 +173,38 @@ export default function Home() {
     };
   }, []);
 
-  const handleStart = () => {
+  // Handle starting a new session
+  const handleStart = (config: SessionConfig) => {
+    setCurrentSessionId(config.sessionId);
+    createSessionMutation.mutate(config, {
+      onSuccess: () => {
+        setHasStarted(true);
+        startRoundMutation.mutate(config.sessionId);
+      },
+    });
+  };
+
+  // Handle loading an existing session
+  const handleLoadSession = async (sessionId: string) => {
+    setCurrentSessionId(sessionId);
     setHasStarted(true);
-    startRoundMutation.mutate();
+    // Start a new round for this session
+    startRoundMutation.mutate(sessionId);
+  };
+
+  // Handle starting a new session from the session manager
+  const handleNewSession = () => {
+    setCurrentSessionId(null);
+    setHasStarted(false);
+    setCurrentSong(null);
+    setRecommendations([]);
+    setSelectedSongIds(new Set());
+    setRoundStatus("idle");
+    stopPolling();
   };
 
   const handleToggleSong = (songId: number) => {
-    setSelectedSongIds(prev => {
+    setSelectedSongIds((prev) => {
       const next = new Set(prev);
       if (next.has(songId)) {
         next.delete(songId);
@@ -127,12 +215,38 @@ export default function Home() {
     });
   };
 
+  // When user confirms selection, show the like reason modal
   const handleConfirmSelection = () => {
+    if (currentRoundId === null) return;
+
+    if (selectedSongIds.size > 0) {
+      // Get the selected songs
+      const selectedSongs = recommendations
+        .filter((item) => selectedSongIds.has(item.songId))
+        .map((item) => item.song);
+      setPendingSelectedSongs(selectedSongs);
+      setShowLikeReasonModal(true);
+    } else {
+      // No songs selected, just skip
+      submitSelection({});
+    }
+  };
+
+  // Submit selection with optional reasons
+  const submitSelection = (likeReasons: Record<number, string>) => {
     if (currentRoundId === null) return;
     selectMutation.mutate({
       roundId: currentRoundId,
       songIds: Array.from(selectedSongIds),
+      likeReasons,
+      sessionId: currentSessionId,
     });
+    setShowLikeReasonModal(false);
+    setPendingSelectedSongs([]);
+  };
+
+  const handleSkipReasons = () => {
+    submitSelection({});
   };
 
   const handleSkip = () => {
@@ -140,11 +254,12 @@ export default function Home() {
     selectMutation.mutate({
       roundId: currentRoundId,
       songIds: [],
+      sessionId: currentSessionId,
     });
   };
 
   const handleRetry = () => {
-    startRoundMutation.mutate();
+    startRoundMutation.mutate(currentSessionId || undefined);
   };
 
   const handlePlaySong = (song: Song) => {
@@ -157,7 +272,14 @@ export default function Home() {
   };
 
   if (!hasStarted) {
-    return <WelcomeScreen onStart={handleStart} isLoading={startRoundMutation.isPending} />;
+    return (
+      <WelcomeScreen
+        onStart={handleStart}
+        onLoadSession={handleLoadSession}
+        sessions={sessions}
+        isLoading={createSessionMutation.isPending || startRoundMutation.isPending}
+      />
+    );
   }
 
   return (
@@ -167,13 +289,18 @@ export default function Home() {
           <Music2 className="w-5 h-5 text-primary" />
           <h1 className="text-lg font-semibold tracking-tight">Lyric Lens</h1>
           <span className="text-sm text-muted-foreground ml-1">by lyrics, for you</span>
+          <div className="ml-auto">
+            <SessionManager
+              currentSessionId={currentSessionId}
+              onLoadSession={handleLoadSession}
+              onNewSession={handleNewSession}
+            />
+          </div>
         </header>
 
         <div className="flex-1 overflow-y-auto">
           <div className="max-w-4xl mx-auto px-4 py-6 space-y-6">
-            {currentSong && (
-              <YouTubePlayer song={currentSong} />
-            )}
+            {currentSong && <YouTubePlayer song={currentSong} />}
 
             <RecommendationCards
               items={recommendations}
@@ -194,6 +321,13 @@ export default function Home() {
         onPlay={handlePlaySong}
         onRemove={handleRemoveFromPlaylist}
         currentSongId={currentSong?.id}
+      />
+
+      <LikeReasonModal
+        open={showLikeReasonModal}
+        songs={pendingSelectedSongs}
+        onConfirm={submitSelection}
+        onSkip={handleSkipReasons}
       />
     </div>
   );
