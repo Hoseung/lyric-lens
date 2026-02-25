@@ -1,7 +1,8 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { generateRecommendations } from "./recommendation";
+import { generateRecommendations, analyzeLyricsForPlaylistItems } from "./recommendation";
+import type { Song } from "@shared/schema";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -133,21 +134,33 @@ export async function registerRoutes(
         return res.status(400).json({ error: "selectedSongIds must be an array" });
       }
 
+      const addedPlaylistItems: Array<{ playlistItemId: number; song: Song }> = [];
+
       if (selectedSongIds.length > 0) {
         await storage.markItemsSelected(roundId, selectedSongIds);
 
         for (const songId of selectedSongIds) {
           const likeReason = likeReasons?.[songId] || null;
-          await storage.addToPlaylist({
+          const playlistItem = await storage.addToPlaylist({
             songId,
             roundId,
             sessionId: sessionId || null,
             likeReason,
           });
+          const song = await storage.getSong(songId);
+          if (song) {
+            addedPlaylistItems.push({ playlistItemId: playlistItem.id, song });
+          }
         }
       }
 
       await storage.updateRoundStatus(roundId, "consumed");
+
+      if (addedPlaylistItems.length > 0) {
+        analyzeLyricsForPlaylistItems(addedPlaylistItems).catch(err => {
+          console.error("Background lyric analysis failed:", err);
+        });
+      }
 
       let autoplaySong = null;
       if (selectedSongIds.length > 0) {

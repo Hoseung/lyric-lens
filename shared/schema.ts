@@ -57,6 +57,7 @@ export const playlistItems = pgTable("playlist_items", {
   selectedAt: timestamp("selected_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
   roundId: integer("round_id").references(() => recommendationRounds.id),
   likeReason: text("like_reason"),
+  lyricAnalysis: text("lyric_analysis"),
 });
 
 // Insert schemas

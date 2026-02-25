@@ -19,6 +19,7 @@ interface LLMRecommendation {
 interface PlaylistContext {
   song: Song;
   likeReason: string | null;
+  lyricAnalysis: string | null;
 }
 
 function buildUserPrompt(context: {
@@ -47,11 +48,13 @@ function buildUserPrompt(context: {
     const recentSongs = context.playlistContext.slice(0, 30);
     prompt += recentSongs.map(item => {
       let entry = `- ${item.song.artist} - ${item.song.title}`;
-      if (item.likeReason) {
-        entry += `\n  Why they liked it: ${item.likeReason}`;
-      }
-      if (item.song.lyricSummary) {
+      if (item.lyricAnalysis) {
+        entry += `\n  Lyric analysis: ${item.lyricAnalysis}`;
+      } else if (item.song.lyricSummary) {
         entry += `\n  Lyric style: ${item.song.lyricSummary}`;
+      }
+      if (item.likeReason) {
+        entry += `\n  User's note: ${item.likeReason}`;
       }
       return entry;
     }).join('\n');
@@ -70,8 +73,9 @@ function buildUserPrompt(context: {
   prompt += `Rules:
 - Recommend exactly 5 songs
 - Each must be a REAL song by a REAL artist
-- Consider the user's stated preferences when making recommendations
-- Pay close attention to why the user liked previous songs - find songs with similar lyrical qualities
+- CAREFULLY study the lyric analyses of previously liked songs — identify recurring patterns in imagery, emotional tone, themes, and poetic style
+- Use these patterns to find songs with genuinely similar lyrical DNA, not just the same genre or artist
+- Consider the user's stated preferences and personal notes as well
 - Prioritize Korean songs with beautiful lyrics
 - Mix well-known and lesser-known artists
 - Avoid repeating any previously recommended songs
@@ -204,5 +208,58 @@ Always recommend REAL songs by REAL artists. Never invent fictional songs.`;
   } catch (error) {
     console.error("Recommendation generation failed:", error);
     await storage.updateRoundStatus(roundId, "failed");
+  }
+}
+
+export async function analyzeLyricsForPlaylistItems(
+  playlistItemIds: Array<{ playlistItemId: number; song: Song }>
+): Promise<void> {
+  if (playlistItemIds.length === 0) return;
+
+  const songsInfo = playlistItemIds.map(item =>
+    `[ID:${item.playlistItemId}] ${item.song.artist} - ${item.song.title}` +
+    (item.song.lyricExcerpt ? `\nLyric excerpt: ${item.song.lyricExcerpt}` : '') +
+    (item.song.lyricSummary ? `\nExisting summary: ${item.song.lyricSummary}` : '')
+  ).join('\n\n');
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-5.2",
+      messages: [
+        {
+          role: "system",
+          content: `You are a Korean lyrics analyst. For each song provided, produce a concise but insightful analysis of its lyric characteristics. Focus on:
+- Dominant imagery and sensory palette (visual, tactile, temporal)
+- Emotional register and temperature (warm/cool, intimate/distant, raw/restrained)
+- Thematic concerns (love, solitude, memory, urban life, nature, existential, etc.)
+- Poetic devices (metaphor density, conversational vs. literary tone, repetition patterns)
+- Unique signature (what makes THIS song's lyrics distinctive)
+
+Write each analysis in Korean, 2-4 sentences. Be specific — avoid generic descriptions.
+Respond in JSON format with an array of objects containing "id" (the playlist item ID) and "analysis" (the Korean text).`
+        },
+        {
+          role: "user",
+          content: `Analyze the lyric characteristics of these songs:\n\n${songsInfo}\n\nRespond as: { "analyses": [{ "id": <playlistItemId>, "analysis": "..." }] }`
+        }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.7,
+      max_completion_tokens: 2048,
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) return;
+
+    const parsed = JSON.parse(content) as { analyses: Array<{ id: number; analysis: string }> };
+    if (!parsed.analyses) return;
+
+    for (const item of parsed.analyses) {
+      if (item.id && item.analysis) {
+        await storage.updatePlaylistItemAnalysis(item.id, item.analysis);
+      }
+    }
+  } catch (error) {
+    console.error("Lyric analysis failed:", error);
   }
 }

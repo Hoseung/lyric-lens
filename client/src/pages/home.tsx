@@ -38,6 +38,8 @@ export default function Home() {
     queryKey: ["/api/sessions"],
   });
 
+  const [hasUnanalyzed, setHasUnanalyzed] = useState(false);
+
   // Fetch playlist scoped to current session
   const { data: playlist = [], refetch: refetchPlaylist } = useQuery<PlaylistItemWithSong[]>({
     queryKey: ["/api/playlist", { sessionId: currentSessionId }],
@@ -47,9 +49,12 @@ export default function Home() {
         : "/api/playlist";
       const res = await fetch(url, { credentials: "include" });
       if (!res.ok) throw new Error("Failed to fetch playlist");
-      return res.json();
+      const data = await res.json();
+      setHasUnanalyzed(data.some((item: PlaylistItemWithSong) => !item.lyricAnalysis));
+      return data;
     },
     enabled: hasStarted,
+    refetchInterval: hasUnanalyzed ? 5000 : false,
   });
 
   // Create session mutation

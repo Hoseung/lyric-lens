@@ -53,6 +53,12 @@ export interface IStorage {
   getPlaylistWithReasons(sessionId: string): Promise<Array<{
     song: Song;
     likeReason: string | null;
+    lyricAnalysis: string | null;
+  }>>;
+  updatePlaylistItemAnalysis(id: number, lyricAnalysis: string): Promise<void>;
+  getPlaylistItemsWithoutAnalysis(sessionId?: string): Promise<Array<{
+    playlistItemId: number;
+    song: Song;
   }>>;
 }
 
@@ -254,20 +260,49 @@ export class DatabaseStorage implements IStorage {
   async getPlaylistWithReasons(sessionId: string): Promise<Array<{
     song: Song;
     likeReason: string | null;
+    lyricAnalysis: string | null;
   }>> {
     const items = await db.select()
       .from(playlistItems)
       .where(eq(playlistItems.sessionId, sessionId))
       .orderBy(desc(playlistItems.selectedAt));
 
-    const result: Array<{ song: Song; likeReason: string | null }> = [];
+    const result: Array<{ song: Song; likeReason: string | null; lyricAnalysis: string | null }> = [];
     for (const item of items) {
       const [song] = await db.select().from(songs).where(eq(songs.id, item.songId));
       if (song) {
         result.push({
           song,
           likeReason: item.likeReason,
+          lyricAnalysis: item.lyricAnalysis,
         });
+      }
+    }
+    return result;
+  }
+
+  async updatePlaylistItemAnalysis(id: number, lyricAnalysis: string): Promise<void> {
+    await db.update(playlistItems)
+      .set({ lyricAnalysis })
+      .where(eq(playlistItems.id, id));
+  }
+
+  async getPlaylistItemsWithoutAnalysis(sessionId?: string): Promise<Array<{
+    playlistItemId: number;
+    song: Song;
+  }>> {
+    let query = db.select().from(playlistItems);
+    const conditions = [sql`${playlistItems.lyricAnalysis} IS NULL`];
+    if (sessionId) {
+      conditions.push(eq(playlistItems.sessionId, sessionId) as any);
+    }
+    const items = await query.where(and(...conditions));
+
+    const result: Array<{ playlistItemId: number; song: Song }> = [];
+    for (const item of items) {
+      const [song] = await db.select().from(songs).where(eq(songs.id, item.songId));
+      if (song) {
+        result.push({ playlistItemId: item.id, song });
       }
     }
     return result;
